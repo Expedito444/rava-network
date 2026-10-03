@@ -4,7 +4,8 @@ const crypto = require("crypto");
 const PORT = process.env.PORT || 3000;
 
 // ========================================
-// RAVA BLOCKCHAIN - EXPERIMENTAL 3
+// RAVA BLOCKCHAIN - EXPERIMENTAL 4
+// PROOF OF WORK
 // ========================================
 
 class Block {
@@ -13,7 +14,8 @@ class Block {
     this.timestamp = timestamp;
     this.data = data;
     this.previousHash = previousHash;
-    this.hash = this.calculateHash();
+    this.nonce = 0;
+    this.hash = this.mineBlock(4);
   }
 
   calculateHash() {
@@ -23,9 +25,21 @@ class Block {
         this.index +
         this.timestamp +
         JSON.stringify(this.data) +
-        this.previousHash
+        this.previousHash +
+        this.nonce
       )
       .digest("hex");
+  }
+
+  mineBlock(difficulty) {
+    const target = "0".repeat(difficulty);
+
+    while (this.hash === undefined || !this.hash.startsWith(target)) {
+      this.nonce++;
+      this.hash = this.calculateHash();
+    }
+
+    return this.hash;
   }
 }
 
@@ -35,7 +49,7 @@ class Blockchain {
   }
 
   createGenesisBlock() {
-    return new Block(
+    const block = new Block(
       0,
       new Date().toISOString(),
       {
@@ -43,6 +57,8 @@ class Blockchain {
       },
       "0"
     );
+
+    return block;
   }
 
   getLatestBlock() {
@@ -73,11 +89,14 @@ const ravaBlockchain = new Blockchain();
 
 const server = http.createServer((req, res) => {
 
-  // Criar novo bloco
+  // ========================================
+  // MINERAÇÃO
+  // ========================================
+
   if (req.url === "/mine" && req.method === "GET") {
 
     const newBlock = ravaBlockchain.addBlock({
-      mensagem: "Novo bloco criado na RAVA"
+      mensagem: "Bloco minerado na RAVA"
     });
 
     res.writeHead(200, {
@@ -89,8 +108,9 @@ const server = http.createServer((req, res) => {
       JSON.stringify(
         {
           projeto: "RAVA Blockchain Network",
-          versao: "Experimental-3",
-          acao: "novo bloco criado",
+          versao: "Experimental-4",
+          acao: "bloco minerado",
+          dificuldade: 4,
           bloco: newBlock
         },
         null,
@@ -101,7 +121,10 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Visualizar blockchain
+  // ========================================
+  // VISUALIZAR BLOCKCHAIN
+  // ========================================
+
   res.writeHead(200, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*"
@@ -111,8 +134,9 @@ const server = http.createServer((req, res) => {
     JSON.stringify(
       {
         projeto: "RAVA Blockchain Network",
-        versao: "Experimental-3",
+        versao: "Experimental-4",
         status: "online",
+        dificuldade: 4,
         quantidadeDeBlocos: ravaBlockchain.chain.length,
         blockchain: ravaBlockchain.chain
       },
