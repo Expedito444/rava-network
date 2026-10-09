@@ -2,7 +2,7 @@
 const http = require("http");
 const crypto = require("crypto");
 
-const VERSION = "Experimental-7";
+const VERSION = "Experimental-7.1";
 const DIFFICULTY = 4;
 const BLOCK_REWARD = 1;
 const MINING_ADDRESS = "RAVA_MINING_REWARD";
@@ -18,12 +18,12 @@ function sendJson(res, status, data) {
 }
 
 function validAddress(address) {
-  return typeof address === "string" && /^[a-f0-9]{40}$/i.test(address);
+  return typeof address === "string" &&
+    /^[a-f0-9]{40}$/i.test(address);
 }
 
 function addressFromPublicKey(publicKey) {
-  return crypto
-    .createHash("sha256")
+  return crypto.createHash("sha256")
     .update(publicKey)
     .digest("hex")
     .slice(0, 40);
@@ -63,9 +63,15 @@ function verifyTransaction(tx) {
   try {
     if (!tx || tx.from === MINING_ADDRESS) return false;
     if (!validAddress(tx.from) || !validAddress(tx.to)) return false;
+    if (tx.from === tx.to) return false;
     if (!Number.isFinite(tx.amount) || tx.amount <= 0) return false;
-    if (typeof tx.publicKey !== "string" || !tx.signature) return false;
-    if (addressFromPublicKey(tx.publicKey) !== tx.from) return false;
+    if (typeof tx.publicKey !== "string") return false;
+    if (typeof tx.signature !== "string") return false;
+    if (!/^[a-f0-9]+$/i.test(tx.signature)) return false;
+
+    if (addressFromPublicKey(tx.publicKey) !== tx.from) {
+      return false;
+    }
 
     const verifier = crypto.createVerify("SHA256");
     verifier.update(transactionData(tx));
@@ -91,8 +97,7 @@ class Block {
   }
 
   calculateHash() {
-    return crypto
-      .createHash("sha256")
+    return crypto.createHash("sha256")
       .update(JSON.stringify({
         index: this.index,
         timestamp: this.timestamp,
@@ -127,7 +132,8 @@ class Blockchain {
     return this.chain[this.chain.length - 1];
   }
 
-  getBalance(address, includePending = true) {
+  // Calcula saldos usando somente blocos confirmados.
+  getConfirmedBalance(address) {
     let balance = 0;
 
     for (const block of this.chain) {
@@ -137,40 +143,41 @@ class Blockchain {
       }
     }
 
-    if (includePending) {
-      for (const tx of this.pendingTransactions) {
-        if (tx.from === address) balance -= tx.amount;
-      }
+    return Number(balance.toFixed(8));
+  }
+
+  // Reserva o valor das transferências que ainda estão pendentes.
+  getAvailableBalance(address) {
+    let balance = this.getConfirmedBalance(address);
+
+    for (const tx of this.pendingTransactions) {
+      if (tx.from === address) balance -= tx.amount;
     }
 
     return Number(balance.toFixed(8));
   }
 
   getTotalSupply() {
-    let supply = 0;
+    let total = 0;
 
     for (const block of this.chain) {
       for (const tx of block.transactions) {
         if (tx.from === MINING_ADDRESS) {
-          supply += tx.amount;
+          total += tx.amount;
         }
       }
     }
 
-    return Number(supply.toFixed(8));
+    return Number(total.toFixed(8));
   }
 
   addTransaction(tx) {
     if (!verifyTransaction(tx)) {
-      throw new Error("Assinatura ou dados da transação inválidos.");
+      throw new Error("Transação ou assinatura inválida.");
     }
 
-    if (tx.from === tx.to) {
-      throw new Error("Origem e destino devem ser diferentes.");
-    }
-
-    if (this.getBalance(tx.from) < tx.amount) {
-      throw new Error("Saldo insuficiente para essa transferência.");
+    if (this.getAvailableBalance(tx.from) < tx.amount) {
+      throw new Error("Saldo insuficiente ou valor já reservado.");
     }
 
     this.pendingTransactions.push({
@@ -189,55 +196,117 @@ class Blockchain {
       throw new Error("Informe um endereço válido para minerar.");
     }
 
+    // Revalida as transações pendentes antes de incluí-las.
+    const validTransactions = [];
+    const reserved = new Map();
+
+    for (const tx of this.pendingTransactions) {
+      if (!verifyTransaction(tx)) continue;
+
+      const confirmed = this.getConfirmedBalance(tx.from);
+      const alreadyReserved = reserved.get(tx.from) || 0;
+
+      if (confirmed - alreadyReserved < tx.amount) continue;
+
+      validTransactions.push(tx);
+      reserved.set(tx.from, alreadyReserved + tx.amount);
+    }
+
     const rewardTransaction = {
       from: MINING_ADDRESS,
       to: minerAddress,
       amount: this.reward
     };
 
-    const transactions = [
-      ...this.pendingTransactions,
-      rewardTransaction
-    ];
-
     const block = new Block(
       this.chain.length,
-      transactions,
+      [...validTransactions, rewardTransaction],
       this.lastBlock.hash
     );
 
     block.mine(this.difficulty);
     this.chain.push(block);
+
+    // Limpa a fila. Transações inválidas ou sem saldo não são mineradas.
     this.pendingTransactions = [];
 
-    return block;
+    return {
+      block,
+      transacoesIncluidas: validTransactions.length
+    };
   }
 
+  // Reconstrói os saldos desde o início e valida cada bloco.
   isValid() {
+    if (!Array.isArray(this.chain) || this.chain.length === 0) {
+      return false;
+    }
+
+    const genesis = this.chain[0];
+
+    if (genesis.index !== 0) return false;
+    if (genesis.previousHash !== "0") return false;
+    if (!Array.isArray(genesis.transactions) ||
+        genesis.transactions.length !== 0) return false;
+    if (genesis.hash !== genesis.calculateHash()) return false;
+
+    const balances = new Map();
+
+    const getBalance = address => balances.get(address) || 0;
+
+    const credit = (address, amount) => {
+      balances.set(
+        address,
+        Number((getBalance(address) + amount).toFixed(8))
+      );
+    };
+
+    const debit = (address, amount) => {
+      balances.set(
+        address,
+        Number((getBalance(address) - amount).toFixed(8))
+      );
+    };
+
     for (let i = 1; i < this.chain.length; i++) {
-      const current = this.chain[i];
+      const block = this.chain[i];
       const previous = this.chain[i - 1];
 
-      if (current.hash !== current.calculateHash()) return false;
-      if (current.previousHash !== previous.hash) return false;
-
-      if (!current.hash.startsWith("0".repeat(this.difficulty))) {
+      if (block.index !== i) return false;
+      if (block.previousHash !== previous.hash) return false;
+      if (block.hash !== block.calculateHash()) return false;
+      if (!block.hash.startsWith("0".repeat(this.difficulty))) {
         return false;
       }
 
-      const rewards = current.transactions.filter(
-        tx => tx.from === MINING_ADDRESS
+      if (!Array.isArray(block.transactions) ||
+          block.transactions.length === 0) return false;
+
+      const rewards = block.transactions.filter(
+        tx => tx && tx.from === MINING_ADDRESS
       );
 
       if (rewards.length !== 1) return false;
-      if (rewards[0].amount !== this.reward) return false;
-      if (!validAddress(rewards[0].to)) return false;
 
-      for (const tx of current.transactions) {
-        if (tx.from !== MINING_ADDRESS && !verifyTransaction(tx)) {
-          return false;
-        }
+      const rewardTx = block.transactions[block.transactions.length - 1];
+
+      if (rewardTx.from !== MINING_ADDRESS) return false;
+      if (rewardTx.amount !== this.reward) return false;
+      if (!validAddress(rewardTx.to)) return false;
+
+      // Primeiro valida e aplica transferências normais.
+      for (let j = 0; j < block.transactions.length - 1; j++) {
+        const tx = block.transactions[j];
+
+        if (!verifyTransaction(tx)) return false;
+        if (getBalance(tx.from) < tx.amount) return false;
+
+        debit(tx.from, tx.amount);
+        credit(tx.to, tx.amount);
       }
+
+      // A recompensa só entra no saldo depois das transferências.
+      credit(rewardTx.to, rewardTx.amount);
     }
 
     return true;
@@ -269,7 +338,7 @@ const server = http.createServer(async (req, res) => {
         recompensaPorBloco: rava.reward,
         moedasEmCirculacao: rava.getTotalSupply(),
         transacoesPendentes: rava.pendingTransactions.length,
-        aviso: "Rede experimental; os dados não são persistentes."
+        aviso: "Versão educacional; os dados não são persistentes."
       });
     }
 
@@ -282,7 +351,7 @@ const server = http.createServer(async (req, res) => {
         address: wallet.address,
         publicKey: wallet.publicKey,
         privateKey: wallet.privateKey,
-        aviso: "TESTE APENAS. Nunca use esta chave com dinheiro real."
+        aviso: "TESTE APENAS. Não use com dinheiro real."
       });
     }
 
@@ -298,7 +367,8 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         versao: VERSION,
         address,
-        saldoDisponivel: rava.getBalance(address),
+        saldoConfirmado: rava.getConfirmedBalance(address),
+        saldoDisponivel: rava.getAvailableBalance(address),
         moedasEmCirculacao: rava.getTotalSupply()
       });
     }
@@ -321,7 +391,7 @@ const server = http.createServer(async (req, res) => {
 
       if (!validAddress(from) || !validAddress(to)) {
         return sendJson(res, 400, {
-          erro: "Os endereços de origem e destino devem ser válidos."
+          erro: "Endereço de origem ou destino inválido."
         });
       }
 
@@ -358,27 +428,26 @@ const server = http.createServer(async (req, res) => {
       tx.publicKey = publicKey;
       tx.signature = signer.sign(privateKey, "hex");
 
-      const pendentes = rava.addTransaction(tx);
+      const pending = rava.addTransaction(tx);
 
       return sendJson(res, 201, {
         versao: VERSION,
-        acao: "transação assinada e adicionada à fila",
-        transacao: tx,
+        acao: "transação adicionada",
+        transacao: {
+          from: tx.from,
+          to: tx.to,
+          amount: tx.amount,
+          publicKey: tx.publicKey,
+          signature: tx.signature
+        },
         assinaturaValida: verifyTransaction(tx),
-        transacoesPendentes: pendentes
+        transacoesPendentes: pending
       });
     }
 
     if (url.pathname === "/transaction" && req.method === "GET") {
       return sendJson(res, 405, {
-        erro: "Use POST com JSON para enviar uma transação.",
-        exemplo: {
-          from: "endereco_de_origem",
-          to: "endereco_de_destino",
-          amount: 0.5,
-          publicKey: "chave_publica",
-          privateKey: "chave_privada_de_teste"
-        }
+        erro: "Use POST com JSON para enviar uma transação."
       });
     }
 
@@ -387,18 +456,19 @@ const server = http.createServer(async (req, res) => {
 
       if (!minerAddress) {
         return sendJson(res, 400, {
-          erro: "Informe sua carteira usando ?miner=SEU_ENDERECO"
+          erro: "Informe uma carteira usando ?miner=SEU_ENDERECO"
         });
       }
 
-      const block = rava.minePendingTransactions(minerAddress);
+      const result = rava.minePendingTransactions(minerAddress);
 
       return sendJson(res, 200, {
         versao: VERSION,
         acao: "bloco minerado",
         recompensa: rava.reward,
-        bloco: block,
-        saldoDoMinerador: rava.getBalance(minerAddress),
+        transacoesIncluidas: result.transacoesIncluidas,
+        bloco: result.block,
+        saldoDoMinerador: rava.getConfirmedBalance(minerAddress),
         moedasEmCirculacao: rava.getTotalSupply()
       });
     }
@@ -422,13 +492,8 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 404, {
       erro: "Rota não encontrada.",
       rotas: [
-        "/",
-        "/wallet",
-        "/balance",
-        "/transaction",
-        "/mine",
-        "/validate",
-        "/chain"
+        "/", "/wallet", "/balance", "/transaction",
+        "/mine", "/validate", "/chain"
       ]
     });
   } catch (error) {
