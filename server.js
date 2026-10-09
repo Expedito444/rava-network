@@ -93,15 +93,13 @@ class Block {
   calculateHash() {
     return crypto
       .createHash("sha256")
-      .update(
-        JSON.stringify({
-          index: this.index,
-          timestamp: this.timestamp,
-          transactions: this.transactions,
-          previousHash: this.previousHash,
-          nonce: this.nonce
-        })
-      )
+      .update(JSON.stringify({
+        index: this.index,
+        timestamp: this.timestamp,
+        transactions: this.transactions,
+        previousHash: this.previousHash,
+        nonce: this.nonce
+      }))
       .digest("hex");
   }
 
@@ -122,15 +120,14 @@ class Blockchain {
     this.reward = BLOCK_REWARD;
     this.difficulty = DIFFICULTY;
 
-    const genesis = new Block(0, [], "0");
-    this.chain.push(genesis);
+    this.chain.push(new Block(0, [], "0"));
   }
 
   get lastBlock() {
     return this.chain[this.chain.length - 1];
   }
 
-  getBalance(address) {
+  getBalance(address, includePending = true) {
     let balance = 0;
 
     for (const block of this.chain) {
@@ -140,9 +137,10 @@ class Blockchain {
       }
     }
 
-    // Pending outgoing transfers reserve the sender's coins.
-    for (const tx of this.pendingTransactions) {
-      if (tx.from === address) balance -= tx.amount;
+    if (includePending) {
+      for (const tx of this.pendingTransactions) {
+        if (tx.from === address) balance -= tx.amount;
+      }
     }
 
     return Number(balance.toFixed(8));
@@ -153,7 +151,9 @@ class Blockchain {
 
     for (const block of this.chain) {
       for (const tx of block.transactions) {
-        if (tx.from === MINING_ADDRESS) supply += tx.amount;
+        if (tx.from === MINING_ADDRESS) {
+          supply += tx.amount;
+        }
       }
     }
 
@@ -166,7 +166,7 @@ class Blockchain {
     }
 
     if (tx.from === tx.to) {
-      throw new Error("A carteira de origem e destino devem ser diferentes.");
+      throw new Error("Origem e destino devem ser diferentes.");
     }
 
     if (this.getBalance(tx.from) < tx.amount) {
@@ -186,7 +186,7 @@ class Blockchain {
 
   minePendingTransactions(minerAddress) {
     if (!validAddress(minerAddress)) {
-      throw new Error("Informe um endereço de carteira válido para minerar.");
+      throw new Error("Informe um endereço válido para minerar.");
     }
 
     const rewardTransaction = {
@@ -220,6 +220,7 @@ class Blockchain {
 
       if (current.hash !== current.calculateHash()) return false;
       if (current.previousHash !== previous.hash) return false;
+
       if (!current.hash.startsWith("0".repeat(this.difficulty))) {
         return false;
       }
@@ -268,7 +269,7 @@ const server = http.createServer(async (req, res) => {
         recompensaPorBloco: rava.reward,
         moedasEmCirculacao: rava.getTotalSupply(),
         transacoesPendentes: rava.pendingTransactions.length,
-        aviso: "Rede experimental: dados ainda não são persistentes."
+        aviso: "Rede experimental; os dados não são persistentes."
       });
     }
 
@@ -281,7 +282,7 @@ const server = http.createServer(async (req, res) => {
         address: wallet.address,
         publicKey: wallet.publicKey,
         privateKey: wallet.privateKey,
-        aviso: "TESTE APENAS. Não use esta chave com dinheiro real."
+        aviso: "TESTE APENAS. Nunca use esta chave com dinheiro real."
       });
     }
 
@@ -290,7 +291,7 @@ const server = http.createServer(async (req, res) => {
 
       if (!validAddress(address)) {
         return sendJson(res, 400, {
-          erro: "Informe um endereço válido: /balance?address=SEU_ENDERECO"
+          erro: "Informe um endereço válido usando ?address=SEU_ENDERECO"
         });
       }
 
@@ -307,8 +308,11 @@ const server = http.createServer(async (req, res) => {
 
       for await (const chunk of req) {
         body += chunk;
+
         if (body.length > 20000) {
-          return sendJson(res, 413, { erro: "Requisição muito grande." });
+          return sendJson(res, 413, {
+            erro: "Requisição muito grande."
+          });
         }
       }
 
@@ -323,14 +327,14 @@ const server = http.createServer(async (req, res) => {
 
       if (!Number.isFinite(amount) || amount <= 0) {
         return sendJson(res, 400, {
-          erro: "O valor deve ser um número maior que zero."
+          erro: "O valor deve ser maior que zero."
         });
       }
 
       if (typeof publicKey !== "string" ||
           typeof privateKey !== "string") {
         return sendJson(res, 400, {
-          erro: "Envie publicKey e privateKey da carteira de teste."
+          erro: "Envie as chaves da carteira de teste."
         });
       }
 
@@ -346,8 +350,8 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      const signer = crypto.createSign("SHA256");
       const tx = { from, to, amount };
+      const signer = crypto.createSign("SHA256");
       signer.update(transactionData(tx));
       signer.end();
 
@@ -383,7 +387,7 @@ const server = http.createServer(async (req, res) => {
 
       if (!minerAddress) {
         return sendJson(res, 400, {
-          erro: "Informe sua carteira: /mine?miner=SEU_ENDERECO"
+          erro: "Informe sua carteira usando ?miner=SEU_ENDERECO"
         });
       }
 
@@ -393,7 +397,7 @@ const server = http.createServer(async (req, res) => {
         versao: VERSION,
         acao: "bloco minerado",
         recompensa: rava.reward,
-        bloco,
+        bloco: block,
         saldoDoMinerador: rava.getBalance(minerAddress),
         moedasEmCirculacao: rava.getTotalSupply()
       });
@@ -417,7 +421,15 @@ const server = http.createServer(async (req, res) => {
 
     return sendJson(res, 404, {
       erro: "Rota não encontrada.",
-      rotas: ["/", "/wallet", "/balance", "/transaction", "/mine", "/validate", "/chain"]
+      rotas: [
+        "/",
+        "/wallet",
+        "/balance",
+        "/transaction",
+        "/mine",
+        "/validate",
+        "/chain"
+      ]
     });
   } catch (error) {
     return sendJson(res, 400, {
