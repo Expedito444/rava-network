@@ -1,18 +1,27 @@
 
 const http = require("http");
 const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
 
-const VERSION = "Experimental-7.2";
+const VERSION = "Experimental-7.3";
 const DIFFICULTY = 4;
 const BLOCK_REWARD = 1;
 const MINING_ADDRESS = "RAVA_MINING_REWARD";
+const DATA_FILE =
+  process.env.RAVA_DATA_FILE ||
+  path.join(__dirname, "rava-data.json");
+
+const UNIT = 100000000;
 
 function sendJson(res, status, data) {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type"
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Cache-Control": "no-store",
+    "X-Content-Type-Options": "nosniff"
   });
   res.end(JSON.stringify(data, null, 2));
 }
@@ -20,6 +29,26 @@ function sendJson(res, status, data) {
 function validAddress(address) {
   return typeof address === "string" &&
     /^[a-f0-9]{40}$/.test(address);
+}
+
+function validAmount(amount) {
+  if (typeof amount !== "number" ||
+      !Number.isFinite(amount) ||
+      amount <= 0) {
+    return false;
+  }
+
+  const scaled = amount * UNIT;
+  return Number.isSafeInteger(Math.round(scaled)) &&
+    Math.abs(scaled - Math.round(scaled)) < 0.00001;
+}
+
+function units(amount) {
+  return Math.round(amount * UNIT);
+}
+
+function coins(value) {
+  return Number((value / UNIT).toFixed(8));
 }
 
 function addressFromPublicKey(publicKey) {
@@ -37,8 +66,6 @@ function transactionData(tx) {
   });
 }
 
-// Converte a assinatura ECDSA P-256 do formato Web Crypto
-// (r || s, 64 bytes) para DER, usado pelo Node.js.
 function rawEcdsaToDer(raw) {
   if (raw.length !== 64) {
     throw new Error("Tamanho de assinatura inválido.");
@@ -75,18 +102,13 @@ function verifyTransaction(tx) {
     if (!tx || tx.from === MINING_ADDRESS) return false;
     if (!validAddress(tx.from) || !validAddress(tx.to)) return false;
     if (tx.from === tx.to) return false;
-    if (!Number.isSafeInteger(tx.amount) && !Number.isFinite(tx.amount)) {
-      return false;
-    }
-    if (tx.amount <= 0 || !Number.isFinite(tx.amount)) return false;
+    if (!validAmount(tx.amount)) return false;
     if (typeof tx.publicKey !== "string") return false;
     if (typeof tx.signature !== "string") return false;
-    if (!/^[a-f0-9]+$/i.test(tx.signature)) return false;
+    if (!/^[a-f0-9]{128}$/i.test(tx.signature)) return false;
     if (addressFromPublicKey(tx.publicKey) !== tx.from) return false;
 
-    const signature = Buffer.from(tx.signature, "hex");
-    const der = rawEcdsaToDer(signature);
-
+    const der = rawEcdsaToDer(Buffer.from(tx.signature, "hex"));
     const verifier = crypto.createVerify("SHA256");
     verifier.update(transactionData(tx), "utf8");
     verifier.end();
@@ -131,39 +153,41 @@ class Block {
 
 class Blockchain {
   constructor() {
-    this.chain = [];
+    this.chain = [new Block(0, [], "0")];
     this.pendingTransactions = [];
     this.reward = BLOCK_REWARD;
     this.difficulty = DIFFICULTY;
-
-    this.chain.push(new Block(0, [], "0"));
   }
 
   get lastBlock() {
     return this.chain[this.chain.length - 1];
   }
 
-  getConfirmedBalance(address) {
+  getConfirmedUnits(address) {
     let balance = 0;
 
     for (const block of this.chain) {
       for (const tx of block.transactions) {
-        if (tx.to === address) balance += tx.amount;
-        if (tx.from === address) balance -= tx.amount;
+        if (tx.to === address) balance += units(tx.amount);
+        if (tx.from === address) balance -= units(tx.amount);
       }
     }
 
-    return Number(balance.toFixed(8));
+    return balance;
+  }
+
+  getConfirmedBalance(address) {
+    return coins(this.getConfirmedUnits(address));
   }
 
   getAvailableBalance(address) {
-    let balance = this.getConfirmedBalance(address);
+    let balance = this.getConfirmedUnits(address);
 
     for (const tx of this.pendingTransactions) {
-      if (tx.from === address) balance -= tx.amount;
+      if (tx.from === address) balance -= units(tx.amount);
     }
 
-    return Number(balance.toFixed(8));
+    return coins(balance);
   }
 
   getTotalSupply() {
@@ -171,11 +195,11 @@ class Blockchain {
 
     for (const block of this.chain) {
       for (const tx of block.transactions) {
-        if (tx.from === MINING_ADDRESS) supply += tx.amount;
+        if (tx.from === MINING_ADDRESS) supply += units(tx.amount);
       }
     }
 
-    return Number(supply.toFixed(8));
+    return coins(supply);
   }
 
   addTransaction(tx) {
@@ -187,13 +211,16 @@ class Blockchain {
       throw new Error("Saldo disponível insuficiente.");
     }
 
-    this.pendingTransactions.push({
+    const pending = {
       from: tx.from,
       to: tx.to,
       amount: tx.amount,
       publicKey: tx.publicKey,
       signature: tx.signature
-    });
+    };
+
+    this.pendingTransactions.push(pending);
+    saveState(this);
 
     return this.pendingTransactions.length;
   }
@@ -204,10 +231,9 @@ class Blockchain {
     }
 
     const balances = new Map();
-
     const balanceOf = address => {
       if (!balances.has(address)) {
-        balances.set(address, this.getConfirmedBalance(address));
+        balances.set(address, this.getConfirmedUnits(address));
       }
       return balances.get(address);
     };
@@ -216,10 +242,10 @@ class Blockchain {
 
     for (const tx of this.pendingTransactions) {
       if (!verifyTransaction(tx)) continue;
-      if (balanceOf(tx.from) < tx.amount) continue;
+      if (balanceOf(tx.from) < units(tx.amount)) continue;
 
-      balances.set(tx.from, balanceOf(tx.from) - tx.amount);
-      balances.set(tx.to, balanceOf(tx.to) + tx.amount);
+      balances.set(tx.from, balanceOf(tx.from) - units(tx.amount));
+      balances.set(tx.to, balanceOf(tx.to) + units(tx.amount));
       included.push(tx);
     }
 
@@ -239,6 +265,13 @@ class Blockchain {
     this.chain.push(block);
     this.pendingTransactions = [];
 
+    if (!this.isValid()) {
+      this.chain.pop();
+      throw new Error("Bloco rejeitado pela validação da blockchain.");
+    }
+
+    saveState(this);
+
     return {
       block,
       transacoesIncluidas: included.length
@@ -246,7 +279,9 @@ class Blockchain {
   }
 
   isValid() {
-    if (this.chain.length === 0) return false;
+    if (!Array.isArray(this.chain) || this.chain.length === 0) {
+      return false;
+    }
 
     const genesis = this.chain[0];
 
@@ -264,109 +299,179 @@ class Blockchain {
     const balanceOf = address => balances.get(address) || 0;
 
     const changeBalance = (address, amount) => {
-      balances.set(
-        address,
-        Number((balanceOf(address) + amount).toFixed(8))
-      );
+      const next = balanceOf(address) + amount;
+      if (!Number.isSafeInteger(next)) {
+        throw new Error("Saldo fora do intervalo permitido.");
+      }
+      balances.set(address, next);
     };
 
-    for (let i = 1; i < this.chain.length; i++) {
-      const block = this.chain[i];
-      const previous = this.chain[i - 1];
+    try {
+      for (let i = 1; i < this.chain.length; i++) {
+        const block = this.chain[i];
+        const previous = this.chain[i - 1];
 
-      if (block.index !== i) return false;
-      if (block.hash !== block.calculateHash()) return false;
-      if (block.previousHash !== previous.hash) return false;
-      if (!block.hash.startsWith("0".repeat(this.difficulty))) {
-        return false;
+        if (block.index !== i) return false;
+        if (block.hash !== block.calculateHash()) return false;
+        if (block.previousHash !== previous.hash) return false;
+        if (!block.hash.startsWith("0".repeat(this.difficulty))) {
+          return false;
+        }
+
+        if (!Array.isArray(block.transactions) ||
+            block.transactions.length === 0) {
+          return false;
+        }
+
+        const rewards = block.transactions.filter(
+          tx => tx.from === MINING_ADDRESS
+        );
+
+        if (rewards.length !== 1) return false;
+
+        const rewardTx = block.transactions[block.transactions.length - 1];
+
+        if (rewardTx.from !== MINING_ADDRESS ||
+            rewardTx.amount !== this.reward ||
+            !validAddress(rewardTx.to)) {
+          return false;
+        }
+
+        for (let j = 0; j < block.transactions.length - 1; j++) {
+          const tx = block.transactions[j];
+
+          if (!verifyTransaction(tx)) return false;
+          if (balanceOf(tx.from) < units(tx.amount)) return false;
+
+          changeBalance(tx.from, -units(tx.amount));
+          changeBalance(tx.to, units(tx.amount));
+        }
+
+        changeBalance(rewardTx.to, units(rewardTx.amount));
       }
-
-      if (!Array.isArray(block.transactions) ||
-          block.transactions.length === 0) {
-        return false;
-      }
-
-      const rewards = block.transactions.filter(
-        tx => tx.from === MINING_ADDRESS
-      );
-
-      if (rewards.length !== 1) return false;
-
-      const rewardTx = block.transactions[block.transactions.length - 1];
-
-      if (rewardTx.from !== MINING_ADDRESS) return false;
-      if (rewardTx.amount !== this.reward) return false;
-      if (!validAddress(rewardTx.to)) return false;
-
-      for (let j = 0; j < block.transactions.length - 1; j++) {
-        const tx = block.transactions[j];
-
-        if (!verifyTransaction(tx)) return false;
-        if (balanceOf(tx.from) < tx.amount) return false;
-
-        changeBalance(tx.from, -tx.amount);
-        changeBalance(tx.to, tx.amount);
-      }
-
-      changeBalance(rewardTx.to, rewardTx.amount);
+    } catch {
+      return false;
     }
 
     return true;
   }
 }
 
-const rava = new Blockchain();
+function saveState(blockchain) {
+  const data = {
+    version: VERSION,
+    chain: blockchain.chain,
+    pendingTransactions: blockchain.pendingTransactions
+  };
+
+  const tempFile = DATA_FILE + ".tmp";
+  fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+  fs.writeFileSync(tempFile, JSON.stringify(data), { mode: 0o600 });
+  fs.renameSync(tempFile, DATA_FILE);
+}
+
+function loadState() {
+  if (!fs.existsSync(DATA_FILE)) {
+    const fresh = new Blockchain();
+    saveState(fresh);
+    return fresh;
+  }
+
+  const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+
+  if (!data || !Array.isArray(data.chain) ||
+      !Array.isArray(data.pendingTransactions)) {
+    throw new Error("Arquivo de dados RAVA inválido; não foi sobrescrito.");
+  }
+
+  const blockchain = new Blockchain();
+
+  blockchain.chain = data.chain.map(raw => {
+    const block = Object.create(Block.prototype);
+    Object.assign(block, raw);
+    return block;
+  });
+
+  blockchain.pendingTransactions = data.pendingTransactions;
+  blockchain.reward = BLOCK_REWARD;
+  blockchain.difficulty = DIFFICULTY;
+
+  if (!blockchain.isValid()) {
+    throw new Error("Blockchain salva inválida; dados preservados para análise.");
+  }
+
+  for (const tx of blockchain.pendingTransactions) {
+    if (!verifyTransaction(tx)) {
+      throw new Error("Transação pendente inválida no arquivo de dados.");
+    }
+  }
+
+  return blockchain;
+}
+
+let rava = loadState();
 
 const WALLET_HTML = `<!doctype html>
 <html lang="pt-BR">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Carteira RAVA Experimental-7.2</title>
+<title>Carteira RAVA Experimental-7.3</title>
 <style>
 body{font-family:Arial,sans-serif;max-width:760px;margin:30px auto;padding:0 16px;background:#10151d;color:#f1f5f9}
 .card{background:#1b2430;padding:18px;border-radius:12px;margin:16px 0}
 input,textarea,button{box-sizing:border-box;width:100%;padding:12px;margin:7px 0;border-radius:7px;border:1px solid #465365;font:inherit}
 input,textarea{background:#10151d;color:#f1f5f9}
 button{background:#8de0b1;color:#102018;font-weight:bold;cursor:pointer}
-small{color:#bac5d3;overflow-wrap:anywhere}
-.notice{color:#ffd38a}
+small,.notice{color:#ffd38a;overflow-wrap:anywhere}
+pre{white-space:pre-wrap;overflow-wrap:anywhere}
 </style>
 </head>
 <body>
 <h1>RAVA Network</h1>
-<p>Carteira experimental — versão 7.2</p>
+<p>Carteira experimental — versão 7.3</p>
+
 <div class="card">
-<h2>1. Criar carteira local</h2>
-<p>A chave privada é criada no navegador e não é enviada ao servidor.</p>
-<button id="create">Gerar carteira de teste</button>
+<h2>1. Criar ou recuperar carteira</h2>
+<p>A chave privada é criada ou importada no navegador. Ela não é enviada ao servidor.</p>
+<button id="create">Gerar carteira nova</button>
+<label>Importar arquivo de carteira JSON</label>
+<input id="walletFile" type="file" accept=".json,application/json">
+<button id="import">Importar carteira selecionada</button>
+<button id="export">Exportar carteira para arquivo JSON</button>
 <p>Endereço</p><textarea id="address" rows="2" readonly></textarea>
 <p>Chave pública</p><textarea id="pub" rows="4" readonly></textarea>
 <p>Chave privada — guarde com cuidado</p>
 <textarea id="priv" rows="5" readonly></textarea>
-<p class="notice">Não compartilhe sua chave privada. Esta carteira é apenas para testes.</p>
+<p class="notice">Nunca compartilhe a chave privada. Guarde o arquivo exportado em local seguro. Esta carteira é experimental.</p>
+<pre id="walletResult"></pre>
 </div>
+
 <div class="card">
 <h2>2. Saldo</h2>
 <button id="balance">Consultar saldo</button>
 <pre id="balanceResult"></pre>
 </div>
+
 <div class="card">
 <h2>3. Enviar RVA</h2>
 <label>Endereço de destino</label>
 <input id="to" placeholder="Endereço público do destinatário">
-<label>Valor</label>
-<input id="amount" type="number" min="0.00000001" step="any" placeholder="0.5">
+<label>Valor (até 8 casas decimais)</label>
+<input id="amount" type="number" min="0.00000001" step="0.00000001" placeholder="0.5">
 <button id="send">Assinar e enviar</button>
 <pre id="sendResult"></pre>
 </div>
+
 <script>
 let wallet = null;
 const el = id => document.getElementById(id);
+
 function hex(bytes) {
   return Array.from(new Uint8Array(bytes))
     .map(b => b.toString(16).padStart(2, "0")).join("");
 }
+
 function pem(label, bytes) {
   let binary = "";
   for (const b of new Uint8Array(bytes)) binary += String.fromCharCode(b);
@@ -375,50 +480,157 @@ function pem(label, bytes) {
   return "-----BEGIN " + label + "-----\\n" +
     lines + "\\n-----END " + label + "-----\\n";
 }
+
+function fromPem(text) {
+  const base64 = text
+    .replace(/-----BEGIN [^-]+-----/g, "")
+    .replace(/-----END [^-]+-----/g, "")
+    .replace(/\\s/g, "");
+  const binary = atob(base64);
+  return Uint8Array.from(binary, c => c.charCodeAt(0));
+}
+
 async function makeAddress(publicPem) {
   const digest = await crypto.subtle.digest(
     "SHA-256", new TextEncoder().encode(publicPem)
   );
   return hex(digest).slice(0, 40);
 }
+
 async function request(url, options) {
   const response = await fetch(url, options);
   const data = await response.json();
   if (!response.ok) throw new Error(data.erro || "Falha na requisição");
   return data;
 }
+
+function showWallet(address, publicKey, privateKey) {
+  el("address").value = address;
+  el("pub").value = publicKey;
+  el("priv").value = privateKey;
+}
+
+async function importWalletObject(data) {
+  if (!data || typeof data.publicKey !== "string" ||
+      typeof data.privateKey !== "string") {
+    throw new Error("Arquivo de carteira inválido.");
+  }
+
+  const publicBytes = fromPem(data.publicKey);
+  const privateBytes = fromPem(data.privateKey);
+
+  const publicKey = await crypto.subtle.importKey(
+    "spki", publicBytes,
+    {name:"ECDSA", namedCurve:"P-256"}, true, ["verify"]
+  );
+
+  const privateKey = await crypto.subtle.importKey(
+    "pkcs8", privateBytes,
+    {name:"ECDSA", namedCurve:"P-256"}, true, ["sign"]
+  );
+
+  const challenge = crypto.getRandomValues(new Uint8Array(32));
+  const signature = await crypto.subtle.sign(
+    {name:"ECDSA", hash:"SHA-256"}, privateKey, challenge
+  );
+
+  const matches = await crypto.subtle.verify(
+    {name:"ECDSA", hash:"SHA-256"}, publicKey, signature, challenge
+  );
+
+  if (!matches) throw new Error("As chaves não correspondem.");
+
+  const address = await makeAddress(data.publicKey);
+
+  if (data.address && data.address !== address) {
+    throw new Error("O endereço não corresponde à chave pública.");
+  }
+
+  wallet = { privateKey, publicKey };
+  showWallet(address, data.publicKey, data.privateKey);
+  el("walletResult").textContent = "Carteira importada e validada.";
+}
+
 el("create").onclick = async () => {
   try {
     wallet = await crypto.subtle.generateKey(
       {name:"ECDSA", namedCurve:"P-256"}, true, ["sign","verify"]
     );
+
     const pubBytes = await crypto.subtle.exportKey("spki", wallet.publicKey);
     const privBytes = await crypto.subtle.exportKey("pkcs8", wallet.privateKey);
     const publicKey = pem("PUBLIC KEY", pubBytes);
     const privateKey = pem("PRIVATE KEY", privBytes);
     const address = await makeAddress(publicKey);
 
-    el("address").value = address;
-    el("pub").value = publicKey;
-    el("priv").value = privateKey;
-    el("balanceResult").textContent = "Carteira criada.";
+    showWallet(address, publicKey, privateKey);
+    el("walletResult").textContent =
+      "Carteira criada. Exporte um arquivo de backup para recuperá-la depois.";
+    el("balanceResult").textContent = "";
+    el("sendResult").textContent = "";
+  } catch (e) {
+    el("walletResult").textContent = "Erro: " + e.message;
+  }
+};
+
+el("export").onclick = () => {
+  try {
+    const address = el("address").value.trim();
+    const publicKey = el("pub").value;
+    const privateKey = el("priv").value;
+
+    if (!wallet || !address || !publicKey || !privateKey) {
+      throw new Error("Gere ou importe uma carteira primeiro.");
+    }
+
+    const data = JSON.stringify({
+      version: "Experimental-7.3",
+      address,
+      publicKey,
+      privateKey
+    }, null, 2);
+
+    const blob = new Blob([data], {type:"application/json"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "rava-wallet-backup.json";
+    a.click();
+    URL.revokeObjectURL(url);
+    el("walletResult").textContent =
+      "Backup exportado. Guarde-o em local seguro.";
+  } catch (e) {
+    el("walletResult").textContent = "Erro: " + e.message;
+  }
+};
+
+el("import").onclick = async () => {
+  try {
+    const file = el("walletFile").files[0];
+    if (!file) throw new Error("Selecione seu arquivo JSON de carteira.");
+
+    const data = JSON.parse(await file.text());
+    await importWalletObject(data);
+  } catch (e) {
+    el("walletResult").textContent = "Erro: " + e.message;
+  }
+};
+
+el("balance").onclick = async () => {
+  try {
+    const address = el("address").value.trim();
+    if (!address) throw new Error("Crie ou importe uma carteira primeiro.");
+    const data = await request("/balance?address=" + encodeURIComponent(address));
+    el("balanceResult").textContent = JSON.stringify(data, null, 2);
   } catch (e) {
     el("balanceResult").textContent = "Erro: " + e.message;
   }
 };
-el("balance").onclick = async () => {
-  try {
-    const address = el("address").value.trim();
-    if (!address) throw new Error("Crie uma carteira primeiro.");
-    const data = await request("/balance?address=" + encodeURIComponent(address));
-    el("balanceResult").textContent = JSON.stringify(data, null, 2);
-  } catch (e) {
-    el("balanceResult").textContent = e.message;
-  }
-};
+
 el("send").onclick = async () => {
   try {
-    if (!wallet) throw new Error("Gere a carteira nesta página antes de enviar.");
+    if (!wallet) throw new Error("Gere ou importe a carteira antes de enviar.");
+
     const from = el("address").value.trim();
     const to = el("to").value.trim();
     const amount = Number(el("amount").value);
@@ -426,11 +638,14 @@ el("send").onclick = async () => {
     if (!/^[a-f0-9]{40}$/.test(to)) {
       throw new Error("Endereço de destino inválido.");
     }
-    if (!Number.isFinite(amount) || amount <= 0) {
-      throw new Error("Informe um valor maior que zero.");
+
+    if (!Number.isFinite(amount) || amount <= 0 ||
+        Math.abs(amount * 100000000 -
+          Math.round(amount * 100000000)) > 0.00001) {
+      throw new Error("Informe um valor positivo com até 8 casas decimais.");
     }
 
-    const tx = {from: from, to: to, amount: amount};
+    const tx = {from, to, amount};
     const bytes = new TextEncoder().encode(JSON.stringify(tx));
     const signature = await crypto.subtle.sign(
       {name:"ECDSA", hash:"SHA-256"}, wallet.privateKey, bytes
@@ -440,9 +655,7 @@ el("send").onclick = async () => {
       method: "POST",
       headers: {"Content-Type":"application/json"},
       body: JSON.stringify({
-        from: from,
-        to: to,
-        amount: amount,
+        ...tx,
         publicKey: el("pub").value,
         signature: hex(signature)
       })
@@ -480,7 +693,8 @@ const server = http.createServer(async (req, res) => {
         recompensaPorBloco: rava.reward,
         moedasEmCirculacao: rava.getTotalSupply(),
         transacoesPendentes: rava.pendingTransactions.length,
-        aviso: "Rede educacional; dados não persistentes."
+        armazenamento: DATA_FILE,
+        aviso: "Projeto educacional. Persistência depende de disco durável no servidor."
       });
     }
 
@@ -527,8 +741,11 @@ const server = http.createServer(async (req, res) => {
       if (!validAddress(from) || !validAddress(to)) {
         return sendJson(res, 400, {erro: "Endereço inválido."});
       }
-      if (!Number.isFinite(amount) || amount <= 0) {
-        return sendJson(res, 400, {erro: "Valor inválido."});
+
+      if (!validAmount(amount)) {
+        return sendJson(res, 400, {
+          erro: "Valor inválido. Use um número positivo com até 8 casas decimais."
+        });
       }
 
       const tx = {from, to, amount, publicKey, signature};
@@ -536,9 +753,9 @@ const server = http.createServer(async (req, res) => {
 
       return sendJson(res, 201, {
         versao: VERSION,
-        acao: "transação assinada localmente e adicionada à fila",
+        acao: "transação assinada e adicionada à fila",
         transacao: tx,
-        assinaturaValida: verifyTransaction(tx),
+        assinaturaValida: true,
         transacoesPendentes: pendentes
       });
     }
