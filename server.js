@@ -3,6 +3,19 @@ const http = require("http");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
+const { Pool } = require("pg");
+
+if (!process.env.DATABASE_URL) {
+  throw new Error("DATABASE_URL não configurada. Adicione a URL do Neon nas variáveis de ambiente do Render.");
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false },
+  max: 5,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000
+});
 
 const VERSION = "Experimental-7.3";
 const DIFFICULTY = 4;
@@ -220,7 +233,6 @@ class Blockchain {
     };
 
     this.pendingTransactions.push(pending);
-    saveState(this);
 
     return this.pendingTransactions.length;
   }
@@ -269,8 +281,6 @@ class Blockchain {
       this.chain.pop();
       throw new Error("Bloco rejeitado pela validação da blockchain.");
     }
-
-    saveState(this);
 
     return {
       block,
@@ -357,31 +367,10 @@ class Blockchain {
   }
 }
 
-function saveState(blockchain) {
-  const data = {
-    version: VERSION,
-    chain: blockchain.chain,
-    pendingTransactions: blockchain.pendingTransactions
-  };
-
-  const tempFile = DATA_FILE + ".tmp";
-  fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
-  fs.writeFileSync(tempFile, JSON.stringify(data), { mode: 0o600 });
-  fs.renameSync(tempFile, DATA_FILE);
-}
-
-function loadState() {
-  if (!fs.existsSync(DATA_FILE)) {
-    const fresh = new Blockchain();
-    saveState(fresh);
-    return fresh;
-  }
-
-  const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
-
+function restoreState(data) {
   if (!data || !Array.isArray(data.chain) ||
       !Array.isArray(data.pendingTransactions)) {
-    throw new Error("Arquivo de dados RAVA inválido; não foi sobrescrito.");
+    throw new Error("Dados salvos da RAVA inválidos; os dados não foram sobrescritos.");
   }
 
   const blockchain = new Blockchain();
@@ -402,14 +391,83 @@ function loadState() {
 
   for (const tx of blockchain.pendingTransactions) {
     if (!verifyTransaction(tx)) {
-      throw new Error("Transação pendente inválida no arquivo de dados.");
+      throw new Error("Transação pendente inválida nos dados salvos.");
     }
   }
 
   return blockchain;
 }
 
-let rava = loadState();
+async function saveState(blockchain) {
+  const data = {
+    version: VERSION,
+    chain: blockchain.chain,
+    pendingTransactions: blockchain.pendingTransactions
+  };
+
+  await pool.query(
+    `INSERT INTO rava_state (id, version, chain, pending_transactions, updated_at)
+     VALUES (1, $1, $2::jsonb, $3::jsonb, NOW())
+     ON CONFLICT (id) DO UPDATE SET
+       version = EXCLUDED.version,
+       chain = EXCLUDED.chain,
+       pending_transactions = EXCLUDED.pending_transactions,
+       updated_at = NOW()`,
+    [
+      VERSION,
+      JSON.stringify(data.chain),
+      JSON.stringify(data.pendingTransactions)
+    ]
+  );
+}
+
+async function loadState() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS rava_state (
+      id SMALLINT PRIMARY KEY CHECK (id = 1),
+      version TEXT NOT NULL,
+      chain JSONB NOT NULL,
+      pending_transactions JSONB NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  const result = await pool.query(
+    "SELECT version, chain, pending_transactions FROM rava_state WHERE id = 1"
+  );
+
+  if (result.rows.length > 0) {
+    const row = result.rows[0];
+    return restoreState({
+      version: row.version,
+      chain: row.chain,
+      pendingTransactions: row.pending_transactions
+    });
+  }
+
+  // Migration only: if the old local JSON file still exists, import it once.
+  // After this first save, PostgreSQL becomes the source of truth.
+  if (fs.existsSync(DATA_FILE)) {
+    let legacyData;
+    try {
+      legacyData = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+    } catch {
+      throw new Error("O arquivo local antigo da RAVA existe, mas não pôde ser lido. Ele foi preservado.");
+    }
+
+    const migrated = restoreState(legacyData);
+    await saveState(migrated);
+    console.log("Estado antigo da RAVA importado para o Neon PostgreSQL.");
+    return migrated;
+  }
+
+  const fresh = new Blockchain();
+  await saveState(fresh);
+  console.log("Banco Neon inicializado com o bloco gênese da RAVA.");
+  return fresh;
+}
+
+let rava;
 
 const WALLET_HTML = `<!doctype html>
 <html lang="pt-BR">
@@ -693,8 +751,9 @@ const server = http.createServer(async (req, res) => {
         recompensaPorBloco: rava.reward,
         moedasEmCirculacao: rava.getTotalSupply(),
         transacoesPendentes: rava.pendingTransactions.length,
-        armazenamento: DATA_FILE,
-        aviso: "Projeto educacional. Persistência depende de disco durável no servidor."
+        armazenamento: "Neon PostgreSQL",
+        persistencia: "ativa",
+        aviso: "Projeto experimental. O estado da blockchain é salvo no PostgreSQL."
       });
     }
 
@@ -749,7 +808,15 @@ const server = http.createServer(async (req, res) => {
       }
 
       const tx = {from, to, amount, publicKey, signature};
+      const pendingBefore = rava.pendingTransactions.slice();
       const pendentes = rava.addTransaction(tx);
+
+      try {
+        await saveState(rava);
+      } catch (saveError) {
+        rava.pendingTransactions = pendingBefore;
+        throw saveError;
+      }
 
       return sendJson(res, 201, {
         versao: VERSION,
@@ -775,7 +842,17 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
+      const chainBefore = rava.chain.slice();
+      const pendingBefore = rava.pendingTransactions.slice();
       const result = rava.minePendingTransactions(minerAddress);
+
+      try {
+        await saveState(rava);
+      } catch (saveError) {
+        rava.chain = chainBefore;
+        rava.pendingTransactions = pendingBefore;
+        throw saveError;
+      }
 
       return sendJson(res, 200, {
         versao: VERSION,
@@ -818,6 +895,28 @@ const server = http.createServer(async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 
-server.listen(PORT, () => {
-  console.log(VERSION + " da RAVA Network rodando na porta " + PORT);
+async function startServer() {
+  try {
+    rava = await loadState();
+    server.listen(PORT, () => {
+      console.log(VERSION + " da RAVA Network rodando na porta " + PORT);
+      console.log("Persistência ativa: Neon PostgreSQL.");
+    });
+  } catch (error) {
+    console.error("Falha ao iniciar a RAVA Network:", error.message);
+    await pool.end().catch(() => {});
+    process.exitCode = 1;
+  }
+}
+
+process.on("SIGTERM", async () => {
+  server.close();
+  await pool.end().catch(() => {});
 });
+
+process.on("SIGINT", async () => {
+  server.close();
+  await pool.end().catch(() => {});
+});
+
+startServer();
