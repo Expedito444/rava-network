@@ -1,0 +1,17 @@
+
+{
+  "name": "rava-network",
+  "version": "7.3.0",
+  "private": true,
+  "description": "RAVA Network experimental blockchain",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "pg": "^8.16.3"
+  }
+}
